@@ -1,0 +1,3 @@
+[submodule "jpegultrascan"]
+	path = jpegultrascan
+	url = https://github.com/RamKromberg/jpegultrascan
