@@ -1,3 +1,13 @@
+# comparator and harness assets and outputs
+test_images
+.cache_comparator_c
+.cache_comparator_perl
+.cache_perl_baselines
+.cache_c_outputs/
+jpeg-ultra-scan-c
+jpeg-ultra-scan-c_debug
+log0.log
+
 # Prerequisites
 *.d
 
