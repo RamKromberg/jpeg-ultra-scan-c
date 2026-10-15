@@ -4,10 +4,11 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <threads.h>
+#include <jpeglib.h>
 
 // Represents a standalone progressive scan script definition
 typedef struct {
-	jpeg_scan_info scans[64]; /* Passed by value on the queue stack line */
+	jpeg_scan_info scans[256]; /* Allocate space matching maximum profile bounds */
 	int num_scans;
 	int scan_id;
 } scan_config_t;

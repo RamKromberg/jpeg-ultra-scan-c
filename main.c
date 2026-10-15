@@ -1,9 +1,13 @@
+#define _DEFAULT_SOURCE // Expose POSIX features under standard C11 flags
+#define _GNU_SOURCE // Guarantee system core extensions are mapped
+#include <unistd.h> // Explicitly pull in POSIX system configuration APIs
 #include <setjmp.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "channel.h"
 #include "utils.h"
 
 #ifdef DIAGNOSTIC_TRACE
@@ -16,12 +20,15 @@
 
 #define MEMO_BITS_LIMIT 4
 
+/* Global Thread-Safe Pipeline Queue Reference Pointer */
+static csp_channel_t* active_pipeline_channel = NULL;
+
 /* Global Decompression Context Tracking Contexts */
 static struct jpeg_decompress_struct global_dinfo;
 static jvirt_barray_ptr* global_coef_arrays = NULL;
 
 /* Isolated Single-Threaded Longjmp Landing Pads */
-static jmp_buf local_validation_env;
+static thread_local jmp_buf local_validation_env;
 
 /* Stage 2 Global Tree Minimum Metrics Accumulators */
 static size_t best_dc_combined_size = SIZE_MAX;
@@ -176,18 +183,23 @@ static int parse_stream_scan_sizes(const unsigned char* buf, size_t size, size_t
  */
 static void evaluate_and_cache_config(jpeg_scan_info* scans, int num_scans, uint32_t scan_id) {
 	(void) scan_id;
+
+	// ALLOCATED ON STACK: Strictly isolated within this thread's execution frame
 	struct jpeg_compress_struct cinfo;
 	struct jpeg_error_mgr jerr;
-	cinfo.err = jpeg_std_error(&jerr);
 
+	cinfo.err = jpeg_std_error(&jerr);
 	jerr.error_exit = simulation_error_exit;
 
+	// Sets up the localized thread jump-back target
 	if (setjmp(local_validation_env)) {
 		jpeg_destroy_compress(&cinfo);
 		return;
 	}
 
 	jpeg_create_compress(&cinfo);
+
+	// global_dinfo is treated as READ-ONLY here, which is completely thread-safe
 	jpeg_copy_critical_parameters(&global_dinfo, &cinfo);
 
 	cinfo.write_Adobe_marker = FALSE;
@@ -202,6 +214,8 @@ static void evaluate_and_cache_config(jpeg_scan_info* scans, int num_scans, uint
 
 	unsigned char* outbuf = NULL;
 	unsigned long outsize = 0;
+
+	// Allocates thread-local dynamic heap buffer memory safely
 	jpeg_mem_dest(&cinfo, &outbuf, &outsize);
 	jpeg_write_coefficients(&cinfo, global_coef_arrays);
 	jpeg_finish_compress(&cinfo);
@@ -209,7 +223,7 @@ static void evaluate_and_cache_config(jpeg_scan_info* scans, int num_scans, uint
 	int comps = global_dinfo.num_components;
 
 	if (cinfo.err->num_warnings == 0 && outsize > 0) {
-		size_t extracted_sizes[256] = { 0 };
+		size_t extracted_sizes[1024] = { 0 };
 		int parsed_count = parse_stream_scan_sizes(outbuf, outsize, extracted_sizes);
 
 		// Loop through all parsed scans in the bundle matching Perl's collector loop
@@ -218,6 +232,8 @@ static void evaluate_and_cache_config(jpeg_scan_info* scans, int num_scans, uint
 				jpeg_scan_info* s = &scans[i];
 				size_t current_cost = extracted_sizes[i];
 
+				// Direct coordinate array writes are contention-free because
+				// each permutation script owns a mathematically unique target slot.
 				if (s->Ss == 0 && s->Se == 0) { // DC Scan Identification
 					if (s->comps_in_scan == comps) {
 						// Interleaved Multi-Component DC Pass
@@ -251,7 +267,7 @@ static void evaluate_and_cache_config(jpeg_scan_info* scans, int num_scans, uint
 static int append_flat_bit_scans(jpeg_scan_info* target, int plane, int ss, int se, int numbits) {
 	int count = 0;
 	target[count].comps_in_scan = 1;
-	target[count].component_index[0] = plane; // FIX: Strict index assignment
+	target[count].component_index[0] = plane;
 	target[count].Ss = ss;
 	target[count].Se = se;
 	target[count].Ah = 0;
@@ -261,7 +277,7 @@ static int append_flat_bit_scans(jpeg_scan_info* target, int plane, int ss, int 
 	if (numbits > 0) {
 		for (int i = numbits; i > 0; i--) {
 			target[count].comps_in_scan = 1;
-			target[count].component_index[0] = plane; // FIX: Strict index assignment
+			target[count].component_index[0] = plane;
 			target[count].Ss = ss;
 			target[count].Se = se;
 			target[count].Ah = i;
@@ -270,6 +286,24 @@ static int append_flat_bit_scans(jpeg_scan_info* target, int plane, int ss, int 
 		}
 	}
 	return count;
+}
+
+/*
+ * ============================================================================
+ * CSP CHANNELS WORKER THREAD ENTRY POINT
+ * Continuously drains standalone progressive scan scripts from the shared stack
+ * queue, executing independent compression pipelines on isolated stacks.
+ * ============================================================================
+ */
+static int csp_evaluation_worker(void* arg) {
+	csp_channel_t* chan = (csp_channel_t*) arg;
+	scan_config_t task;
+
+	// Loop dynamically blocks and drains tasks until channel_close is broadcast
+	while (channel_receive(chan, &task)) {
+		evaluate_and_cache_config(task.scans, task.num_scans, task.scan_id);
+	}
+	return thrd_success;
 }
 
 /*
@@ -321,7 +355,14 @@ static void profile_ac_scan_permutations(int comps, int plane) {
 
 				uint32_t pack_id = (0x0 << 28) | ((plane & 0xF) << 24) | ((offset & 0xFF) << 16)
 					| ((step_var & 0xFF) << 8) | (b_idx & 0xFF);
-				evaluate_and_cache_config(script_batch, scan_count, pack_id);
+
+				// REFACTORED FOR MULTI-CORE PIPELINE LAUNDERING
+				scan_config_t task;
+				task.num_scans = scan_count;
+				task.scan_id = pack_id;
+				memcpy(task.scans, script_batch, scan_count * sizeof(jpeg_scan_info));
+
+				channel_send(active_pipeline_channel, task);
 			}
 		}
 	}
@@ -381,7 +422,13 @@ static void profile_dc_scan_permutations(int comps) {
 				scan_count++;
 			}
 
-			evaluate_and_cache_config(script_batch, scan_count, 0);
+			// REFACTORED FOR MULTI-CORE PIPELINE LAUNDERING:
+			scan_config_t task;
+			task.num_scans = scan_count;
+			task.scan_id = 0;
+			memcpy(task.scans, script_batch, scan_count * sizeof(jpeg_scan_info));
+
+			channel_send(active_pipeline_channel, task);
 		}
 	}
 
@@ -416,12 +463,16 @@ static void profile_dc_scan_permutations(int comps) {
 				}
 			}
 
-			evaluate_and_cache_config(script_batch, scan_count, 0);
+			// REFACTORED FOR MULTI-CORE PIPELINE LAUNDERING:
+			scan_config_t task;
+			task.num_scans = scan_count;
+			task.scan_id = 0;
+			memcpy(task.scans, script_batch, scan_count * sizeof(jpeg_scan_info));
+
+			channel_send(active_pipeline_channel, task);
 		}
 	}
 }
-
-#define MEMO_BITS_LIMIT 4
 
 typedef struct {
 	jpeg_scan_info scans[128];
@@ -630,7 +681,7 @@ static void evaluate_dc_partition_trees(int comps) {
 
 	if (flag_dc_interleave == 1 && comps > 1) {
 		for (int b = 0; b <= flag_bit_splits; b++) {
-			// FIX: Reference the precise base coordinate index where Ah is 0
+			// Reference the precise base coordinate index where Ah is 0
 			size_t interleaved_cost = dp_dc_interleaved_sizes[0][b];
 			int dest_idx = 0;
 			jpeg_scan_info local_scans[MAX_PLANES * MAX_BITS_LIMIT];
@@ -799,8 +850,8 @@ static size_t run_progressive_pass(unsigned char** out_buf) {
 	}
 
 	/* ============================================================================
-	 * PHASE 1: SYSTEMATIC GRID COLLECTION & TELEMETRY INSTRUMENTATION
-	 * Anchors exact cost keys to isolate Stage 1 generation mismatches.
+	 * PHASE 1: DYNAMIC CONCURRENT CSP SEARCH SPACE DISPATCH ENGINE
+	 * Queries hardware topology dynamically to size queue capacity boundaries
 	 * ============================================================================
 	 */
 	int comps = global_dinfo.num_components;
@@ -821,11 +872,62 @@ static size_t run_progressive_pass(unsigned char** out_buf) {
 		}
 	}
 
-	// 1. Run Procedural Generation Passes
+	// 1. Determine Core Topology Dynamically Natively First
+	int thread_pool_count = 8; // Optimal universal fallback baseline
+#ifdef _WIN32
+	SYSTEM_INFO sysinfo;
+	GetSystemInfo(&sysinfo);
+	thread_pool_count = sysinfo.dwNumberOfProcessors;
+#elif defined(__linux__) || defined(__APPLE__)
+	long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+	if (nprocs > 0)
+		thread_pool_count = (int) nprocs;
+#endif
+
+	// ============================================================================
+	// DYNAMIC CHANNEL CAPACITY SCALING
+	// Sizing capacity to (thread_pool_count * 8) provides a balanced sliding task
+	// window. On an 8-core machine, this creates a depth of 64 (~393 KB heap RAM),
+	// keeping the entire queue ring buffer resident inside L2/L3 hardware caches
+	// while giving the single producer adequate slack to prevent thread stalling.
+	// ============================================================================
+	size_t dynamic_capacity = (size_t) thread_pool_count * 8;
+	if (dynamic_capacity < 32)
+		dynamic_capacity = 32; // Enforce a safe bottom floor bound
+	if (dynamic_capacity > 512)
+		dynamic_capacity = 512; // Enforce an upper barrier ceiling
+
+	active_pipeline_channel = channel_create(dynamic_capacity);
+	if (!active_pipeline_channel) {
+		fprintf(stderr, "[FATAL] Failed to allocate thread communication channel.\n");
+		return 0;
+	}
+
+	// 2. Spawn Kernel Workers Matching Core Density
+	thrd_t* thread_pool = malloc(thread_pool_count * sizeof(thrd_t));
+	for (int t = 0; t < thread_pool_count; t++) {
+		if (thrd_create(&thread_pool[t], csp_evaluation_worker, active_pipeline_channel) != thrd_success) {
+			fprintf(stderr, "[FATAL] Cross-core thread initialization panic at thread node index %d\n", t);
+			exit(1);
+		}
+	}
+
+	// 3. Run Procedural Generation Passes (The Single Producer)
 	for (int plane = 0; plane < comps; plane++) {
 		profile_ac_scan_permutations(comps, plane);
 	}
 	profile_dc_scan_permutations(comps);
+
+	// 4. Tear-Down and Join: Close the stream and block until workers finish flushing caches
+	channel_close(active_pipeline_channel);
+
+	for (int t = 0; t < thread_pool_count; t++) {
+		thrd_join(thread_pool[t], NULL);
+	}
+
+	free(thread_pool);
+	channel_destroy(active_pipeline_channel);
+	active_pipeline_channel = NULL;
 
 	/* ============================================================================
 	 * INSTRUMENTATION 1: PARITY REPLICA TELEMETRY SWEEP (5D RESOLVED)

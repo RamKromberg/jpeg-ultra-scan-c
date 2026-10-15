@@ -316,52 +316,6 @@ void sort_scans_topologically(jpeg_scan_info* scans, int num_scans) {
 	free(order_emitted);
 }
 
-int my_compare_scans_parity(const void* a, const void* b) {
-	const jpeg_scan_info* sa = (const jpeg_scan_info*) a;
-	const jpeg_scan_info* sb = (const jpeg_scan_info*) b;
-
-	if (sa->Ss == 0 && sb->Ss > 0)
-		return -1;
-	if (sa->Ss > 0 && sb->Ss == 0)
-		return 1;
-
-	if (sa->Ss == 0 && sb->Ss == 0) {
-		if (sa->comps_in_scan > 1 && sb->comps_in_scan == 1)
-			return -1;
-		if (sa->comps_in_scan == 1 && sb->comps_in_scan > 1)
-			return 1;
-
-		if (sa->comps_in_scan == 1 && sb->comps_in_scan == 1) {
-			if (sa->component_index[0] != sb->component_index[0]) {
-				return sa->component_index[0] - sb->component_index[0];
-			}
-		}
-
-		if (sa->Ah != sb->Ah) {
-			return sa->Ah - sb->Ah;
-		}
-		return sa->Al - sb->Al;
-	}
-
-	if (sa->Ss != sb->Ss) {
-		return sa->Ss - sb->Ss;
-	}
-
-	if (sa->Se != sb->Se) {
-		return sa->Se - sb->Se;
-	}
-
-	if (sa->component_index[0] != sb->component_index[0]) {
-		return sa->component_index[0] - sb->component_index[0];
-	}
-
-	if (sa->Ah != sb->Ah) {
-		return sa->Ah - sb->Ah;
-	}
-
-	return sa->Al - sb->Al;
-}
-
 static bool scan_depends_on(const jpeg_scan_info* a, const jpeg_scan_info* b) {
 	if (a->Ss != b->Ss) {
 		return a->Ss < b->Ss;
@@ -376,60 +330,6 @@ static bool scan_depends_on(const jpeg_scan_info* a, const jpeg_scan_info* b) {
 		return a->component_index[0] < b->component_index[0];
 	}
 	return false;
-}
-
-void my_sort_scans_topologically(jpeg_scan_info* scans, int num_scans) {
-	if (num_scans <= 1)
-		return;
-
-	jpeg_scan_info* sorted = malloc(num_scans * sizeof(jpeg_scan_info));
-	bool* emitted = calloc(num_scans, sizeof(bool));
-	int sorted_count = 0;
-
-	for (int i = 0; i < num_scans; i++) {
-		if (scans[i].Ss == 0) {
-			sorted[sorted_count++] = scans[i];
-			emitted[i] = true;
-		}
-	}
-
-	while (sorted_count < num_scans) {
-		bool advanced = false;
-		for (int i = 0; i < num_scans; i++) {
-			if (emitted[i])
-				continue;
-
-			bool ready = true;
-			for (int j = 0; j < num_scans; j++) {
-				if (emitted[j] || i == j)
-					continue;
-				if (scan_depends_on(&scans[j], &scans[i])) {
-					ready = false;
-					break;
-				}
-			}
-
-			if (ready) {
-				sorted[sorted_count++] = scans[i];
-				emitted[i] = true;
-				advanced = true;
-			}
-		}
-
-		if (!advanced) {
-			for (int i = 0; i < num_scans; i++) {
-				if (!emitted[i]) {
-					sorted[sorted_count++] = scans[i];
-					emitted[i] = true;
-					break;
-				}
-			}
-		}
-	}
-
-	memcpy(scans, sorted, num_scans * sizeof(jpeg_scan_info));
-	free(sorted);
-	free(emitted);
 }
 
 /*
@@ -541,7 +441,7 @@ void configure_metadata_copy_pipeline(j_compress_ptr cinfo, j_decompress_ptr din
 			int app_id = curr_marker->marker - JPEG_APP0;
 			bool clear_to_write = true;
 
-			// FIX: Only skip APP0 (JFIF) since libjpeg-turbo auto-synthesizes it.
+			// Only skip APP0 (JFIF) since libjpeg-turbo auto-synthesizes it.
 			// Allow APP14 (Adobe) and all other custom segments to be written explicitly.
 			if (curr_marker->marker == (JPEG_APP0 + 0)) {
 				clear_to_write = false;
